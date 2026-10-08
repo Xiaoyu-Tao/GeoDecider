@@ -56,18 +56,18 @@ cd GeoDecider
 ```bash
 conda create -n geodecider python=3.10
 conda activate geodecider
-pip install pandas openai
+pip install -r requirements.txt
 ```
 
 ### 3. Configure the LLM API
 
-Set your API key and model endpoint in `Facies/api.py` and `Facies/tool_call.py`:
+Credentials are read from environment variables and are never stored in source files:
 
-```python
-client = OpenAI(
-    api_key="YOUR_API_KEY",
-    base_url="https://api.deepseek.com",
-)
+```bash
+export GEODECIDER_API_KEY="YOUR_API_KEY"
+# Optional overrides:
+export GEODECIDER_BASE_URL="https://api.deepseek.com"
+export GEODECIDER_MODEL="deepseek-reasoner"
 ```
 
 ### 4. Prepare Input Data
@@ -84,32 +84,100 @@ GeoDecider expects well-log data in CSV format. The current workflow uses the fo
 - `RELPOS`
 - `Predicted_Facies`
 
+For difficulty-aware routing, also provide either:
+
+- `Prediction_Confidence`, containing the maximum classifier score; or
+- one or more class-score columns whose names start with `Prob_`.
+
+If neither is available, the interval is explicitly recorded as
+`confidence_unavailable_safe_slow_path` and enters the slow stage. This avoids
+silently treating an interval as confident without a score.
+
 ### 5. Run GeoDecider
 
-Set the input and output paths in `Facies/main.py`:
-
-```python
-input_file = "path/to/input.csv"
-output_file = "path/to/output.jsonl"
+```bash
+python -m Facies.main \
+  --input path/to/input.csv \
+  --output path/to/output.jsonl \
+  --routing-threshold 0.70
 ```
 
-Then run:
+Run the command from the repository root. Use `python -m Facies.main --help` for
+all options. Results are saved as JSONL records containing routing scores and
+anchors, selected tools, panel outputs, within-run reconciliation, refinement
+records, token accounting, and the final answer. Existing successful window IDs
+are detected when a run resumes; resume no longer relies on the raw number of
+lines in the output file.
+
+To enable nearest-neighbor evidence, pass a labeled **training-only** reference
+CSV:
 
 ```bash
-python Facies/main.py
+python -m Facies.main \
+  --input path/to/input.csv \
+  --output path/to/output.jsonl \
+  --neighbor-reference path/to/training_reference.csv \
+  --neighbor-label-column Facies \
+  --neighbor-well-column WellName
 ```
 
-The results are saved as JSONL records containing the prompt, reasoning trace, final answer, selected tools, panel outputs, and refinement metadata.
+The reference path, fitted feature columns, distances, source rows, well IDs,
+and returned labels are stored in the JSONL record for auditing. Validation and
+test labels must not be included in this reference file.
+
+### Aggregate Independent Runs
+
+Evidence-aware reconciliation combines the three scientific views **within one
+run**. Majority voting across complete stochastic runs is a separate operation:
+
+```bash
+python -m Facies.ensemble \
+  --inputs outputs/run1.jsonl outputs/run2.jsonl outputs/run3.jsonl \
+  --output outputs/ensemble.jsonl
+```
+
+The command verifies that all runs contain identical windows and rows, then
+records per-depth agreement. It refuses to replace an existing output unless
+`--overwrite` is supplied.
 
 ---
 
 ## Workflow
 
-1. Planner: Selects useful geological tools according to the current well-log interval.
-2. Evidence Collection: Builds evidence from feature knowledge, lithofacies definitions, classification heuristics, trend analysis, and optional neighbor retrieval.
-3. Multi-view Reasoning: Generates decisions from expert, model-aware, and trend-focused perspectives.
-4. Panel Aggregation: Aggregates the reasoning outputs into final lithology labels.
-5. Geological Refinement: Corrects predictions that violate depositional environment constraints.
+1. Routing: A below-threshold point activates its complete containing interval;
+   an interval with no anchor retains the fast prediction.
+2. Planner: Selects available geological tools for an activated interval.
+3. Evidence Collection: Builds evidence from feature knowledge, label definitions,
+   heuristics, depth trends, preceding finalized predictions, and optional
+   training-only neighbor retrieval.
+4. Multi-view Reasoning: Generates expert, model-aware, and trend-focused
+   candidates. Every candidate must have the same length as the input and use
+   only declared labels.
+5. Evidence-aware Reconciliation: Uses the evidence profile to resolve the
+   within-run candidates. Majority voting is retained as an explicit fallback;
+   any departure from it requires a recorded support item.
+6. Geological Refinement: Proposed revisions require recorded observed evidence,
+   after which the Facies-specific `NM_M` environment constraint is applied.
+
+## Reproducibility Scope
+
+This repository contains the executable Facies pipeline. It does not currently
+include the licensed/source datasets, trained base-classifier checkpoints, or
+archived predictions needed to reproduce every multi-dataset number in the
+paper. Adding a mechanism to the current code does not establish that an older
+reported experiment used that mechanism. Reproduction packages should identify
+the exact code commit, dataset version and well split, configuration, prompts,
+raw predictions, API model version, and execution logs associated with each
+reported result.
+
+## Tests
+
+The deterministic routing, validation, aggregation, and environment-constraint
+tests do not call an external API:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ---
 

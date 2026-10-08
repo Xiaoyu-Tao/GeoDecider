@@ -1,105 +1,92 @@
-# tool_call.py
-from openai import OpenAI
-import os
+"""Planner for selecting evidence tools."""
+
 import json
+from typing import Iterable, List
 
-extra_body = {"enable_thinking": True}
-
-client = OpenAI(
-    api_key='sk-xxx',
-    base_url="https://api.deepseek.com",
-)
-
-
-def get_tool_call(content: str):
-    response = client.chat.completions.create(
-        model="deepseek-reasoner",
-        messages=[
-            {
-                "role": "system",
-                "content": """You are a planning agent for well-log facies classification.
-
-Return ONLY valid JSON in the following format:
-{
-  "tools": [
-    {"name": "expert_feature_description_tool", "why": "reason ..."},
-    {"name": "trend_analysis_tool", "why": "reason ..."}
-  ]
-}
-
-- The "name" must be one of:
-  - "expert_feature_description_tool"
-  - "expert_label_description_tool"
-  - "classification_suggestions_tool"
-  - "trend_analysis_tool"
-  - "neighbor_find_tool"
-- "why" should briefly explain why this tool is selected.
-""",
-            },
-            {
-                "role": "user",
-                "content": content,
-            },
-        ],
-        stream=False,
-        extra_body=extra_body,
-        response_format={"type": "json_object"},
+try:
+    from .api import get_json_result
+    from .constants import (
+        TOOL_CLASSIFICATION,
+        TOOL_EXPERT_FEATURES,
+        TOOL_EXPERT_LABELS,
+        TOOL_NAMES,
+        TOOL_NEIGHBORS,
+        TOOL_TREND,
+    )
+except ImportError:  # Support ``python Facies/main.py``.
+    from api import get_json_result
+    from constants import (
+        TOOL_CLASSIFICATION,
+        TOOL_EXPERT_FEATURES,
+        TOOL_EXPERT_LABELS,
+        TOOL_NAMES,
+        TOOL_NEIGHBORS,
+        TOOL_TREND,
     )
 
-    think = response.choices[0].message.reasoning_content
-    answer = response.choices[0].message.content  # JSON string
-    return think, answer
+
+PLANNER_SYSTEM_PROMPT = """You are a planning agent for well-log facies classification.
+Return only valid JSON in this form:
+{"tools": [{"name": "tool_name", "why": "brief reason"}]}
+Use only tool names explicitly listed in the user prompt. Select between one and five tools.
+"""
+
+TOOL_DESCRIPTIONS = {
+    TOOL_EXPERT_FEATURES: "explains the well-log features used by the classifier",
+    TOOL_EXPERT_LABELS: "provides domain descriptions of the lithofacies labels",
+    TOOL_CLASSIFICATION: "provides rule-based lithofacies classification heuristics",
+    TOOL_TREND: "analyzes vertical trends in preceding, target, and following intervals",
+    TOOL_NEIGHBORS: "retrieves similar labeled observations from training wells",
+}
 
 
-def build_tool_select_prompt(table_str: str) -> str:
-    prompt = f"""You are an expert planner deciding which tools to run for well-log classification.
+def build_tool_select_prompt(table_str: str, available_tools: Iterable[str]) -> str:
+    tool_lines = "\n".join(
+        f"- {name}: {TOOL_DESCRIPTIONS[name]}"
+        for name in available_tools
+        if name in TOOL_DESCRIPTIONS
+    )
+    return f"""Select complementary evidence tools for the following interval.
 
-Here are the tools you can use:
+Available tools:
+{tool_lines}
 
-1. expert_feature_description_tool
-   - defines and explains key features in well-log data that are critical for classification.
-
-2. expert_label_description_tool
-   - provides detailed descriptions of classification labels based on domain knowledge.
-
-3. expert_classification_suggestions_tool
-   - provides rule-based suggestions and heuristic patterns for mapping logs to lithofacies.
-
-4. trend_analysis_tool
-   - analyzes trends in well-log data (including up/down/target windows) to identify patterns and vertical continuity.
-
-5. neighbor_finding_tool
-   - finds similar well-log cases from a database using a k-nearest-neighbor approach (currently a placeholder).
-
-Selection guidelines:
-- Use a single tool when the pattern is simple and one perspective is clearly sufficient.
-- Use multiple tools when:
-  - Both trend analysis and expert knowledge are needed.
-  - Patterns are complex or ambiguous.
-  - You want both heuristic rules and data-driven references.
-
-OUTPUT FORMAT:
-Return valid JSON exactly as shown:
-{{
-  "tools": [
-    {{"name": "XXX", "why": "Brief reason for selection XXX"}},
-    ...
-  ]
-}}
-
-WELL LOG DATA TO CLASSIFY (partial table, Predicted_Facies hidden here):
+Well-log data (the initial prediction is intentionally hidden):
 {table_str}
 
-Analyze the data characteristics and select 1-5 tools that best complement each other.
-Return ONLY the JSON object described above.
+Return only the requested JSON object.
 """
-    return prompt
 
 
-def get_tool_selection(table_str: str):
-    planner_prompt = build_tool_select_prompt(table_str)
-    think, answer = get_tool_call(planner_prompt)
-    tools_json = json.loads(answer)
-    tools = tools_json.get("tools", [])
-    tool_list = [t["name"] for t in tools]
-    return planner_prompt, think, answer, tool_list
+def get_tool_selection(table_str: str, available_tools: Iterable[str] = TOOL_NAMES):
+    allowed = tuple(name for name in available_tools if name in TOOL_NAMES)
+    if not allowed:
+        raise ValueError("At least one evidence tool must be available.")
+
+    planner_prompt = build_tool_select_prompt(table_str, allowed)
+    think, answer, usage = get_json_result(planner_prompt, PLANNER_SYSTEM_PROMPT)
+    try:
+        tools_json = json.loads(answer)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Planner returned invalid JSON: {exc}") from exc
+
+    raw_tools = tools_json.get("tools", [])
+    if not isinstance(raw_tools, list):
+        raise ValueError("Planner field 'tools' must be a list.")
+
+    selected: List[str] = []
+    reasons = []
+    for item in raw_tools:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if name in allowed and name not in selected:
+            selected.append(name)
+            reasons.append({"name": name, "why": str(item.get("why", ""))})
+
+    if not selected:
+        selected = [TOOL_EXPERT_FEATURES]
+        reasons = [{"name": TOOL_EXPERT_FEATURES, "why": "Safe planner fallback."}]
+
+    normalized_answer = json.dumps({"tools": reasons}, ensure_ascii=False)
+    return planner_prompt, think, normalized_answer, selected, usage

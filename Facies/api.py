@@ -1,58 +1,93 @@
+"""LLM client helpers.
+
+Configuration is read from environment variables so credentials never need to be
+stored in the repository:
+
+* ``GEODECIDER_API_KEY`` (or ``DEEPSEEK_API_KEY``)
+* ``GEODECIDER_BASE_URL`` (default: ``https://api.deepseek.com``)
+* ``GEODECIDER_MODEL`` (default: ``deepseek-reasoner``)
+"""
+
 import os
-from openai import OpenAI
+from typing import Any, Dict, Iterable, Tuple
 
-extra_body = {"enable_thinking": True}
+try:
+    from .constants import FACIES_LABELS
+except ImportError:  # Support ``python Facies/main.py``.
+    from constants import FACIES_LABELS
 
-client = OpenAI(
-    api_key='sk-xxx',
-    base_url="https://api.deepseek.com",
-)
+
+def _client() -> Any:
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError(
+            "The 'openai' package is required for LLM calls. Install requirements.txt."
+        ) from exc
+    api_key = os.getenv("GEODECIDER_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "Missing API key. Set GEODECIDER_API_KEY or DEEPSEEK_API_KEY."
+        )
+    return OpenAI(
+        api_key=api_key,
+        base_url=os.getenv("GEODECIDER_BASE_URL", "https://api.deepseek.com"),
+    )
+
+
+def _usage_dict(usage: Any) -> Dict[str, int]:
+    if usage is None:
+        return {}
+    result = {}
+    for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = getattr(usage, name, None)
+        if value is not None:
+            result[name] = int(value)
+    return result
+
+
+def chat_completion(
+    messages: Iterable[Dict[str, str]], *, json_object: bool = False
+) -> Tuple[str, str, Dict[str, Any]]:
+    request: Dict[str, Any] = {
+        "model": os.getenv("GEODECIDER_MODEL", "deepseek-reasoner"),
+        "messages": list(messages),
+        "stream": False,
+        "extra_body": {"enable_thinking": True},
+    }
+    if json_object:
+        request["response_format"] = {"type": "json_object"}
+
+    response = _client().chat.completions.create(**request)
+    message = response.choices[0].message
+    reasoning = getattr(message, "reasoning_content", None) or ""
+    content = message.content or ""
+    metadata = {
+        "model": getattr(response, "model", request["model"]),
+        "usage": _usage_dict(getattr(response, "usage", None)),
+    }
+    return reasoning, content, metadata
+
+
+def get_json_result(content: str, system_prompt: str):
+    return chat_completion(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ],
+        json_object=True,
+    )
 
 
 def get_result(content: str):
-    response = client.chat.completions.create(
-        model="deepseek-reasoner",
-        messages=[
-            {
-                "role": "system",
-                "content": """Please give your answer in json in the flollowing format:
-{
-  "answer": ["X1", "X2", ...]
-}
-here X1 means the classification result for each depth point.
-There are only nine categories: 'Nonmarine sandstone', 'Nonmarine coarse siltstone', 'Nonmarine fine siltstone',
-'Marine siltstone and shale', 'Mudstone', 'Wackestone', 'Dolomite', 'Packstone-grainstone', 'Phylloid-algal bafflestone'.
-Your result for each depth point should be one of the nine categories above.
-""",
-            },
-            {
-                "role": "user",
-                "content": content,
-            },
-        ],
-        stream=False,
-        extra_body=extra_body,
-        response_format={"type": "json_object"},
+    labels = ", ".join(FACIES_LABELS)
+    system_prompt = (
+        "Classify every input row. Return only a JSON object in the form "
+        '{"answer": ["X1", "X2", ...]}. Each Xi must be one of: '
+        f"{labels}. The answer length must exactly match the number of input rows."
     )
-
-    think = response.choices[0].message.reasoning_content
-    answer = response.choices[0].message.content
-    return think, answer
+    return get_json_result(content, system_prompt)
 
 
 def get_result_trend(content: str):
-    response = client.chat.completions.create(
-        model="deepseek-reasoner",
-        messages=[
-            {
-                "role": "user",
-                "content": content,
-            }
-        ],
-        stream=False,
-        extra_body=extra_body,
-    )
-
-    think = response.choices[0].message.reasoning_content
-    answer = response.choices[0].message.content
-    return think, answer
+    return chat_completion([{"role": "user", "content": content}])
